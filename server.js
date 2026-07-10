@@ -2,7 +2,7 @@ import "dotenv/config";
 import express from "express";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import Anthropic from "@anthropic-ai/sdk";
+import { streamChat, generateOnce, toUserError, LlmError, describeProvider } from "./lib/llm.js";
 import { characters, chats, newId } from "./lib/store.js";
 import {
   buildSystemPrompt,
@@ -12,11 +12,9 @@ import {
   EMOTION_DIMS,
 } from "./lib/prompts.js";
 
-const MODEL = process.env.MODEL || "claude-opus-4-8";
 const PORT = Number(process.env.PORT || 3000);
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 
-const client = new Anthropic();
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 app.use(express.static(path.join(ROOT, "public")));
@@ -71,23 +69,27 @@ function sanitizeCharacter(body = {}) {
 
 app.post("/api/characters/generate", async (req, res) => {
   try {
-    const response = await client.messages.create({
-      model: MODEL,
-      max_tokens: 16000,
-      thinking: { type: "adaptive" },
-      output_config: { format: { type: "json_schema", schema: CHARACTER_SCHEMA } },
-      messages: [{ role: "user", content: characterGenPrompt(req.body?.idea) }],
+    const text = await generateOnce({
+      prompt: characterGenPrompt(req.body?.idea),
+      jsonSchema: CHARACTER_SCHEMA,
     });
-    if (response.stop_reason === "refusal") {
-      return res.status(422).json({ error: "模型拒絕了這個構想，換個描述試試。" });
-    }
-    const text = response.content.find((b) => b.type === "text")?.text ?? "";
-    res.json(JSON.parse(text));
+    res.json(parseJsonLoose(text));
   } catch (err) {
     console.error("generate-character failed:", err);
-    res.status(500).json({ error: apiErrorMessage(err) });
+    const { status, message } = toUserError(err);
+    res.status(status).json({ error: message });
   }
 });
+
+// 寬鬆解析模型輸出的 JSON（容忍 markdown 圍欄或前後說明文字）
+function parseJsonLoose(text) {
+  try { return JSON.parse(text); } catch { /* 繼續嘗試 */ }
+  const match = text.match(/\{[\s\S]*\}/);
+  if (match) {
+    try { return JSON.parse(match[0]); } catch { /* 繼續 */ }
+  }
+  throw new LlmError("模型沒有輸出有效的 JSON，請再按一次生成。", 502);
+}
 
 /* ---------------- 對話 ---------------- */
 
@@ -176,32 +178,17 @@ async function streamReply(chat, res) {
   }
 
   try {
-    const stream = client.messages.stream({
-      model: MODEL,
-      max_tokens: 16000,
-      system: [
-        {
-          type: "text",
-          text: buildSystemPrompt({ ...character, emotions: chat.emotions }, chat.userPersona),
-          cache_control: { type: "ephemeral" },
-        },
-      ],
+    const { text: raw, refusal } = await streamChat({
+      system: buildSystemPrompt({ ...character, emotions: chat.emotions }, chat.userPersona),
       messages: apiMessages,
+      onDelta: (delta) => send("delta", { text: delta }),
     });
-
-    stream.on("text", (delta) => send("delta", { text: delta }));
-
-    const finalMessage = await stream.finalMessage();
-    if (finalMessage.stop_reason === "refusal") {
+    if (refusal) {
       send("error", { error: "模型拒絕了這段內容，試著調整說法或用（OOC）換個劇情方向。" });
       res.end();
       return;
     }
 
-    const raw = finalMessage.content
-      .filter((b) => b.type === "text")
-      .map((b) => b.text)
-      .join("");
     const { text, emotions } = extractMood(raw, chat.emotions);
 
     const message = { id: newId(), role: "assistant", content: text, createdAt: now() };
@@ -211,7 +198,7 @@ async function streamReply(chat, res) {
     send("done", { message, emotions });
   } catch (err) {
     console.error("streamReply failed:", err);
-    send("error", { error: apiErrorMessage(err) });
+    send("error", { error: toUserError(err).message });
   }
   res.end();
 }
@@ -236,20 +223,10 @@ function extractMood(raw, prev) {
   return { text: text.trim(), emotions };
 }
 
-function apiErrorMessage(err) {
-  if (String(err?.message).includes("Could not resolve authentication method")) {
-    return "尚未設定 API 金鑰：請複製 .env.example 為 .env 並填入 ANTHROPIC_API_KEY。";
-  }
-  if (err instanceof Anthropic.AuthenticationError) return "API 金鑰無效，請檢查 .env 的 ANTHROPIC_API_KEY。";
-  if (err instanceof Anthropic.RateLimitError) return "請求太頻繁，稍等一下再試。";
-  if (err instanceof Anthropic.APIConnectionError) return "無法連線到 Anthropic API，請檢查網路。";
-  if (err instanceof Anthropic.APIError) return `API 錯誤（${err.status}）：${err.message}`;
-  return "發生未知錯誤，請查看伺服器日誌。";
-}
-
 app.listen(PORT, () => {
   console.log(`♥ roMANce 已啟動： http://localhost:${PORT}`);
-  if (!process.env.ANTHROPIC_API_KEY) {
-    console.warn("⚠ 尚未設定 ANTHROPIC_API_KEY（將嘗試使用其他登入憑證）");
+  console.log(`  供應商：${describeProvider()}`);
+  if (!process.env.OPENAI_BASE_URL && !process.env.ANTHROPIC_API_KEY) {
+    console.warn("⚠ 尚未設定 ANTHROPIC_API_KEY 或 OPENAI_BASE_URL，聊天時會出現錯誤提示（設定方式見 README）");
   }
 });
