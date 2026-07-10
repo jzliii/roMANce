@@ -1,0 +1,16 @@
+{
+  "name": "romance",
+  "version": "0.1.0",
+  "description": "roMANce — 沉浸式 AI 角色戀愛聊天平台（自用版）",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.78.0",
+    "dotenv": "^16.4.5",
+    "express": "^4.21.0"
+  }
+}
